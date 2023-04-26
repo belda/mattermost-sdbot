@@ -1,0 +1,4 @@
+mattermostdriver
+requests
+websocket-client
+python-slugify

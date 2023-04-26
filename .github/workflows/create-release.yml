@@ -1,0 +1,34 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  create_release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.9"
+
+      - name: Get package version
+        run: |
+          VERSION=$(python -c 'from setuptools.config import read_configuration; print(read_configuration("setup.cfg")["metadata"]["version"])')
+          echo "PACKAGE_VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.PACKAGE_VERSION }}
+          release_name: Release ${{ env.PACKAGE_VERSION }}
+          draft: false
+          prerelease: false
