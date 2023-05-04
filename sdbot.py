@@ -8,20 +8,66 @@ the SD server to be ready again to reconnect to both servers.
 import base64
 import json
 import random
+import threading
 import time
+from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
 from uuid import uuid4
+
+from mattermostdriver.exceptions import InvalidOrMissingParameters
 from slugify import slugify
 import os
 from mattermostdriver import Driver
 import requests
+import pickle
 
 
 BOT_TOKEN = os.environ.get('MMBOT_TOKEN','')
 MM_SERVER_URL = os.environ.get('MM_SERVER_URL','')
 SD_SERVER_URL = os.environ.get('SD_SERVER_URL','')
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE',4))
+NO_RESPONSE_USERNAMES = os.environ.get('NO_RESPONSE_USERNAMES','').split(',')
+ONCE_ONLY_RESPONSE_USERNAMES = os.environ.get('ONCE_ONLY_RESPONSE_USERNAMES','chatgpt').replace('@','').split(',')
+DATA_FILE = os.environ.get('DATA_FILE','data.pickle')
+
+
+class Data:
+    last_check_ts = 0
+    responded_to_threads = set()
+    responded_to_messages = set()
+
+    def __init__(self):
+        ''' Load data from DATA_FILE '''
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE,'rb') as f:
+                data = pickle.load(f)
+                self.last_check_ts = data.last_check_ts
+                self.responded_to_threads = data.responded_to_threads
+                self.responded_to_messages = data.responded_to_messages
+
+    def save(self):
+        ''' Save data to DATA_FILE '''
+        with open(DATA_FILE,'wb') as f:
+            pickle.dump(self,f)
+
+    def add_thread(self,channel_id):
+        self.responded_to_threads.add(channel_id)
+        self.save()
+
+    def add_message(self,message_id):
+        self.responded_to_messages.add(message_id)
+        self.save()
+
+    def check(self, ts = datetime.now().timestamp()):
+        ''' Ticke the last check timestamp '''
+        self.last_check_ts = int(ts)
+        self.save()
+
+
+
+
+db = Data()
 
 
 def ping() -> bool:
@@ -130,11 +176,92 @@ def upload_mm_image(driver : Driver, channel_id: str, image_data: str, filename:
     return file_id
 
 
+def process_post(driver: Driver, my_user:dict, post: dict) -> None:
+    ''' Processes the post and replies to it with the image '''
+    message = post.get('message')
+    channel_id = post.get('channel_id')
+
+    if shall_i_respond(my_user, post):
+        prompt = extract_prompt(message, my_user['username'])
+
+        # now render the image and send it back
+        image_ids = []
+        for i in range(1, BATCH_SIZE + 1):
+            print(f'Rendering image {i} for prompt: {prompt}')
+            task_id = render_image(prompt)
+
+            image = None
+            while image is None:
+                # TODO notify that we are waiting (typing)
+                print(f'Waiting for image {i} to be rendered...')
+                time.sleep(.7)
+                image = fetch_image(task_id)
+
+            print(f'Image {i} rendered, uploading to Mattermost...')
+            filename = slugify(prompt) + f'_{i}.jpeg'
+            image_ids.append(upload_mm_image(driver, channel_id, image, filename))
+
+            driver.posts.create_post(options={
+                'channel_id': channel_id,
+                # 'message': f'*{prompt}*',
+                'root_id': post['root_id'] if post['root_id'] != '' else post['id'],
+                'file_ids': image_ids
+            })
+            db.responded_to_messages.add(post['id'])
+            db.responded_to_threads.add(post['channel_id']+"-"+post['root_id'])
+            db.save()
+
+
 def extract_prompt(message: str, username: str) -> str:
     ''' Extracts the prompt from the message, it stripse everything before the @username and everything after the first newline following the prompt '''
     initial_index = message.index(f'@{username}') + len(f'@{username}') + 1
     message = message[initial_index:].strip()
     return message[: message.index('\n')] if '\n' in message else message
+
+
+def shall_i_respond(my_user: dict, post: dict) -> bool:
+    ''' Checks if the bot should respond to the message. If author is in a list of prohibited authors it will return False
+     If the message does not contain the bot's username it will return False and if the author is in the list of only 1 reply list, and is already there
+     it will return False'''
+    if post.get('user_id') == my_user['id']:
+        return False
+    if f'@{my_user["username"]}' not in post.get('message'):
+        return False
+    if post['id'] in db.responded_to_messages:
+        return False
+    if post.get('username') in NO_RESPONSE_USERNAMES:
+        return False
+    if post.get('username') in ONCE_ONLY_RESPONSE_USERNAMES and post['id'] in db.responded_to_threads:
+        return False
+    return True
+
+
+def get_unread_posts(mm_driver: Driver, my_user: dict) -> None:
+    ''' Gets the unread posts from all channels and yields them '''
+    # Get the user's teams
+    teams = mm_driver.teams.get_user_teams(my_user['id'])
+
+    # Iterate through the teams
+    for team in teams:
+        # Get the team's channels
+        channels = mm_driver.channels.get_channels_for_user(my_user['id'], team['id'])
+
+        # Iterate through the channels
+        for channel in channels:
+            # Get the unread posts
+            unread_posts = mm_driver.posts.get_unread_posts_for_channel(my_user['id'], channel['id'], params={"unread": True, "since": db.last_check_ts})
+
+            for key, post in unread_posts["posts"].items():
+                yield post
+        db.check()
+
+
+def fetch_and_process_unread_posts(mm_driver: Driver, my_user: dict) -> None:
+    ''' Fetches the unread posts and processes them '''
+    for post in get_unread_posts(mm_driver, my_user):
+        process_post(mm_driver, my_user, post)
+    threading.Timer(600, fetch_and_process_unread_posts, kwargs={"mm_driver":mm_driver, "my_user":my_user}).start()  # Schedule the job to run every 5 minutes (300 seconds)
+
 
 
 def main() -> None:
@@ -152,39 +279,9 @@ def main() -> None:
         data = json.loads(input)
         if data.get('event') == 'posted':
             post = json.loads(data.get('data').get('post'))
-            message = post.get('message')
-            channel_id = post.get('channel_id')
+            process_post(driver, my_user, post)
 
-            if post.get('user_id') == my_user['id']:
-                return
-            if f'@{my_user["username"]}' not in message:
-                return
-
-            prompt = extract_prompt(message, my_user['username'])
-
-            # now render the image and send it back
-            image_ids = []
-            for i in range(1, BATCH_SIZE+1):
-                print(f'Rendering image {i} for prompt: {prompt}')
-                task_id = render_image(prompt)
-
-                image = None
-                while image is None:
-                    # TODO notify that we are waiting (typing)
-                    print(f'Waiting for image {i} to be rendered...')
-                    time.sleep(.7)
-                    image = fetch_image(task_id)
-
-                print(f'Image {i} rendered, uploading to Mattermost...')
-                filename = slugify(prompt) + f'_{i}.jpeg'
-                image_ids.append( upload_mm_image(driver, channel_id, image, filename) )
-
-                driver.posts.create_post(options={
-                    'channel_id': channel_id,
-                    # 'message': f'*{prompt}*',
-                    'root_id': post['root_id'] if post['root_id'] != '' else post['id'],
-                    'file_ids': image_ids
-                })
+    fetch_and_process_unread_posts(driver, my_user)
 
     driver.init_websocket(handle_event)
 
