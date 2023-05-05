@@ -27,7 +27,7 @@ BOT_TOKEN = os.environ.get('MMBOT_TOKEN','')
 MM_SERVER_URL = os.environ.get('MM_SERVER_URL','')
 SD_SERVER_URL = os.environ.get('SD_SERVER_URL','')
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE',4))
-NO_RESPONSE_USERNAMES = os.environ.get('NO_RESPONSE_USERNAMES','').split(',')
+NO_RESPONSE_USERNAMES = os.environ.get('NO_RESPONSE_USERNAMES','').replace('@','').split(',')
 ONCE_ONLY_RESPONSE_USERNAMES = os.environ.get('ONCE_ONLY_RESPONSE_USERNAMES','chatgpt').replace('@','').split(',')
 DATA_FILE = os.environ.get('DATA_FILE','data.pickle')
 
@@ -207,9 +207,9 @@ def process_post(driver: Driver, my_user:dict, post: dict) -> None:
                 'root_id': post['root_id'] if post['root_id'] != '' else post['id'],
                 'file_ids': image_ids
             })
-            db.responded_to_messages.add(post['id'])
-            db.responded_to_threads.add(post['channel_id']+"-"+post['root_id'])
-            db.save()
+        db.responded_to_messages.add(post['id'])
+        db.responded_to_threads.add(post['channel_id']+"-"+post['root_id'])
+        db.save()
 
 
 def extract_prompt(message: str, username: str) -> str:
